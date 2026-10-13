@@ -29,6 +29,11 @@ def settings():
         'read_token': '',
         'ingest_token': '',
         'push_url': '',
+
+        # Set through environment variables or GitHub Actions Secrets.
+        'supabase_url': '',
+        'supabase_secret_key': '',
+
         'db_path': str(BASE / 'data' / 'mmf1.sqlite3'),
         'capture_dir': str(BASE / 'data' / 'captures'),
         'outbox_dir': str(BASE / 'data' / 'outbox'),
