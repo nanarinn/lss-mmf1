@@ -6,6 +6,8 @@ from pathlib import Path
 import threading
 import time
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 import uuid
 import paho.mqtt.client as mqtt
 from settings import GROUPS, settings, valid_topic
@@ -101,7 +103,69 @@ def collect(cfg):
     return list(latest.values()), meta
 
 
+def supabase_config(cfg):
+    url = str(cfg.get('supabase_url', '')).strip().rstrip('/')
+    key = str(cfg.get('supabase_secret_key', '')).strip()
+    if not url and not key:
+        return None
+    if not url or not key:
+        raise ValueError('Set both LSS_SUPABASE_URL and LSS_SUPABASE_SECRET_KEY')
+    parsed = urlparse(url)
+    if (parsed.scheme != 'https' or not parsed.hostname
+            or not parsed.hostname.endswith('.supabase.co')
+            or parsed.username or parsed.password or parsed.port
+            or parsed.path or parsed.query or parsed.fragment):
+        raise ValueError('LSS_SUPABASE_URL must be the HTTPS Supabase project URL')
+    if not key.startswith('sb_secret_'):
+        raise ValueError('Use a Supabase secret key starting with sb_secret_')
+    return url, key
+
+
+def send_to_supabase(cfg, records):
+    connection = supabase_config(cfg)
+    if connection is None:
+        logging.info('Supabase is not configured; using existing storage only')
+        return
+    url, key = connection
+    columns = (
+        'topic', 'received_at_utc', 'qos', 'retain',
+        'payload_text', 'payload_json', 'payload_base64',
+    )
+    rows = [
+        {column: record.get(column) for column in columns}
+        for record in records if valid_topic(record['topic'])
+    ]
+    if not rows:
+        return
+    request = Request(
+        url + '/rest/v1/mqtt_readings',
+        data=json.dumps(rows).encode('utf-8'),
+        method='POST',
+        headers={
+            'Content-Type': 'application/json',
+            'apikey': key,
+            'Prefer': 'return=minimal',
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            if response.status not in (200, 201, 204):
+                raise RuntimeError('Supabase did not confirm the insert')
+    except HTTPError as error:
+        status = error.code
+        error.close()
+        raise RuntimeError(
+            'Supabase upload failed (HTTP %s). Check the secret key, '
+            'Data API and table permissions.' % status
+        ) from None
+    except (URLError, TimeoutError):
+        raise RuntimeError(
+            'Supabase upload failed due to a network error or timeout'
+        ) from None
+    logging.info('Saved %s readings to Supabase mqtt_readings', len(rows))
+
 def refresh(cfg):
+    supabase_config(cfg)  # Validate before capturing or sending data.
     records, meta = collect(cfg)
     if cfg['push_url']:
         if not cfg['push_url'].startswith('https://') or not cfg['ingest_token']:
@@ -136,6 +200,7 @@ def refresh(cfg):
     else:
         save_batch(cfg['db_path'], records, meta)
         write_capture(cfg['capture_dir'], records, meta)
+    send_to_supabase(cfg, records)
     logging.info('Refreshed %s topics: %s', len(records), meta['topics_by_group'])
 
 
